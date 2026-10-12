@@ -47,23 +47,18 @@ TABLE_C = [
     [4, 4, 4, 5, 6, 7, 7], [4, 4, 5, 6, 6, 7, 7], [5, 5, 6, 6, 7, 7, 7], [5, 5, 6, 7, 7, 7, 7]
 ]
 
-# ==================== 【模型載入 (快取避免重複下載)】 ====================
+# ==================== 【模型載入】 ====================
 @st.cache_resource
-def load_yolo():
-    # 使用官方輕量高精度 YOLOv8-Pose 模型
-    return YOLO("yolov8n-pose.pt")
+def load_yolo_model(model_name="yolov8s-pose.pt"):
+    return YOLO(model_name)
 
-# ==================== 【高精度 2D 平面幾何運算】 ====================
+# ==================== 【幾何運算與人因評分】 ====================
 def calculate_2d_angle(a, b, c):
-    """
-    計算以點 b 為頂點之 2D 夾角 (度數)
-    向量 ba 與 bc 之夾角，完全捨棄不可靠的 Z 軸震盪
-    """
     ba = np.array([a[0] - b[0], a[1] - b[1]], dtype=np.float32)
     bc = np.array([c[0] - b[0], c[1] - b[1]], dtype=np.float32)
     norm_ba = np.linalg.norm(ba)
     norm_bc = np.linalg.norm(bc)
-    if norm_ba < 1e-5 or norm_bc < 1e-5:
+    if norm_ba < 1e-4 or norm_bc < 1e-4:
         return 0.0
     cosine = np.clip(np.dot(ba, bc) / (norm_ba * norm_bc), -1.0, 1.0)
     return float(np.degrees(np.arccos(cosine)))
@@ -71,7 +66,7 @@ def calculate_2d_angle(a, b, c):
 def calculate_vector_angle(v1, v2):
     norm_v1 = np.linalg.norm(v1)
     norm_v2 = np.linalg.norm(v2)
-    if norm_v1 < 1e-5 or norm_v2 < 1e-5:
+    if norm_v1 < 1e-4 or norm_v2 < 1e-4:
         return 0.0
     cosine = np.clip(np.dot(v1, v2) / (norm_v1 * norm_v2), -1.0, 1.0)
     return float(np.degrees(np.arccos(cosine)))
@@ -141,22 +136,30 @@ def put_chinese_text(img, text, position, color, size=15):
     draw.text(position, text, fill=(color[2], color[1], color[0]), font=font)
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-# ==================== 【YOLOv8 骨架萃取與分析】 ====================
-# COCO 17 Keypoints 映射表:
-# 0:Nose, 1:L_Eye, 2:R_Eye, 3:L_Ear, 4:R_Ear,
-# 5:L_Shoulder, 6:R_Shoulder, 7:L_Elbow, 8:R_Elbow, 9:L_Wrist, 10:R_Wrist,
-# 11:L_Hip, 12:R_Hip, 13:L_Knee, 14:R_Knee, 15:L_Ankle, 16:R_Ankle
-
-def extract_yolo_landmarks(results):
+# ==================== 【人體骨架偵測與防飄機制】 ====================
+def extract_best_person_landmarks(results):
     if len(results) == 0 or results[0].keypoints is None or len(results[0].keypoints.xy) == 0:
         return None, None
-    pts = results[0].keypoints.xy[0].cpu().numpy()  # shape (17, 2)
-    conf = results[0].keypoints.conf[0].cpu().numpy() if results[0].keypoints.conf is not None else np.ones(17)
+    
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        pts = results[0].keypoints.xy[0].cpu().numpy()
+        conf = results[0].keypoints.conf[0].cpu().numpy() if results[0].keypoints.conf is not None else np.ones(17)
+        return pts, conf
+
+    xyxy = boxes.xyxy.cpu().numpy()
+    areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+    confs = boxes.conf.cpu().numpy()
+    scores = areas * confs
+    best_idx = int(np.argmax(scores))
+
+    pts = results[0].keypoints.xy[best_idx].cpu().numpy()
+    conf = results[0].keypoints.conf[best_idx].cpu().numpy() if results[0].keypoints.conf is not None else np.ones(17)
     return pts, conf
 
-def analyze_front_camera_yolo(frame, model, target_side):
-    results = model(frame, verbose=False)
-    pts, conf = extract_yolo_landmarks(results)
+def analyze_front_camera_yolo(frame, model, target_side, inference_size=960):
+    results = model(frame, imgsz=inference_size, conf=0.35, verbose=False)
+    pts, conf = extract_best_person_landmarks(results)
     annotated = results[0].plot() if len(results) > 0 else frame
     
     if pts is None:
@@ -166,20 +169,16 @@ def analyze_front_camera_yolo(frame, model, target_side):
     el_idx = 8 if target_side == "右手側" else 7
     wr_idx = 10 if target_side == "右手側" else 9
     
-    # 身體中線 X 座標
     midline_x = (pts[5][0] + pts[6][0] + pts[11][0] + pts[12][0]) / 4.0
-    shoulder_w = abs(pts[5][0] - pts[6][0])
+    shoulder_w = max(abs(pts[5][0] - pts[6][0]), 10.0)
     
-    # 外展判定
     elbow_out = (pts[el_idx][0] - pts[sh_idx][0]) if target_side == "右手側" else (pts[sh_idx][0] - pts[el_idx][0])
-    is_abducted = elbow_out > (shoulder_w * 0.35)
+    is_abducted = elbow_out > (shoulder_w * 0.32)
     
-    # 越過中線判定
     is_across_midline = (pts[wr_idx][0] < midline_x) if target_side == "右手側" else (pts[wr_idx][0] > midline_x)
     
-    # 軀幹側彎
     shoulder_tilt = abs(pts[5][1] - pts[6][1])
-    is_side_bending = (shoulder_tilt / max(shoulder_w, 1.0)) > 0.15
+    is_side_bending = (shoulder_tilt / shoulder_w) > 0.15
     
     mods = {
         "is_abducted": bool(is_abducted),
@@ -188,9 +187,9 @@ def analyze_front_camera_yolo(frame, model, target_side):
     }
     return True, mods, annotated
 
-def analyze_side_camera_yolo(frame, model, target_side, front_mods, m_val, f_val):
-    results = model(frame, verbose=False)
-    pts, conf = extract_yolo_landmarks(results)
+def analyze_side_camera_yolo(frame, model, target_side, front_mods, m_val, f_val, inference_size=960):
+    results = model(frame, imgsz=inference_size, conf=0.35, verbose=False)
+    pts, conf = extract_best_person_landmarks(results)
     annotated = results[0].plot() if len(results) > 0 else frame
     
     if pts is None:
@@ -202,33 +201,25 @@ def analyze_side_camera_yolo(frame, model, target_side, front_mods, m_val, f_val
     hip_idx = 12 if target_side == "右手側" else 11
     ear_idx = 4 if target_side == "右手側" else 3
     
-    # 關鍵點能見度防護
     vis_scores = [conf[sh_idx], conf[el_idx], conf[wr_idx], conf[hip_idx]]
     mean_conf = float(np.mean(vis_scores) * 100)
-    if min(vis_scores) < 0.35:
-        # 若目標手臂被身體嚴重遮蔽，給予低信賴度
-        mean_conf *= 0.4
+    
+    if conf[el_idx] < 0.35 or conf[wr_idx] < 0.3:
+        mean_conf *= 0.35
 
-    sh = pts[sh_idx]
-    el = pts[el_idx]
-    wr = pts[wr_idx]
-    hp = pts[hip_idx]
-    ear = pts[ear_idx]
+    sh, el, wr = pts[sh_idx], pts[el_idx], pts[wr_idx]
+    hp, ear = pts[hip_idx], pts[ear_idx]
 
-    # 1. 前臂屈曲 (Lower Arm): 180 - 內角
     ang_lower_arm = abs(180.0 - calculate_2d_angle(sh, el, wr))
     
-    # 2. 上臂屈曲 (Upper Arm): 以軀幹主軸向量為基準線
-    v_torso = hp - sh  # 軀幹向量 (由肩指向臀)
-    v_arm = el - sh    # 上臂向量 (由肩指向肘)
+    v_torso = hp - sh
+    v_arm = el - sh
     ang_upper_arm = calculate_vector_angle(v_torso, v_arm)
     
-    # 3. 軀幹前傾 (Trunk): 髖骨至肩膀向量與垂直向上向量 [0, -1] 夾角
     v_trunk_up = sh - hp
     v_vertical_up = np.array([0.0, -1.0], dtype=np.float32)
     ang_trunk = calculate_vector_angle(v_trunk_up, v_vertical_up)
     
-    # 4. 頸部前屈 (Neck): 相對於軀幹軸線
     v_neck = ear - sh
     ang_neck = calculate_vector_angle(v_trunk_up, v_neck)
 
@@ -259,33 +250,40 @@ def analyze_side_camera_yolo(frame, model, target_side, front_mods, m_val, f_val
     }
     return True, data, annotated, mean_conf
 
-# ==================== 【Streamlit 網頁應用介面】 ====================
-st.set_page_config(page_title="YOLOv8-Pose 智慧 RULA 人因分析系統", layout="wide")
-st.title("YOLOv8-Pose 多視角人因工程 (RULA) 自動化評估系統")
-st.markdown("> **專案架構特色**：採用 Ultralytics YOLOv8-Pose 進行高抗噪關鍵點偵測，結合矢狀面 2D 向量投影，杜絕深度抖動，量測精度逼近 $\\pm 1^\\circ \\sim 3^\\circ$。")
+# ==================== 【Streamlit 網頁介面】 ====================
+st.set_page_config(page_title="YOLOv8 高精度 RULA 評估系統", layout="wide")
+st.title("🎯 YOLOv8-Pose 智慧 RULA 人因分析系統")
 
-target_side = st.radio(
-    "🎯 請選擇本次評估作業之【主量測側】:",
-    options=["右手側", "左手側"],
-    index=0,
-    horizontal=True,
-    help="根據 RULA 評估標準，鎖定受測者主要施力或偏向側，避免非受測側肢體遮蔽干擾。"
-)
+col_cfg1, col_cfg2 = st.columns(2)
+with col_cfg1:
+    target_side = st.radio(
+        "🎯 請選擇本次評估作業之【主量測側】:",
+        options=["右手側", "左手側"],
+        index=0,
+        horizontal=True
+    )
+with col_cfg2:
+    model_choice = st.selectbox(
+        "⚡ 選擇 YOLO 精度等級:",
+        options=["yolov8s-pose.pt (推薦：高精度抗抖動)", "yolov8m-pose.pt (旗艦：最高穩定度)", "yolov8n-pose.pt (輕量：極速)"],
+        index=0
+    )
+    selected_model_name = model_choice.split(" ")[0]
 
 st.header("步驟一：上傳多視角測試影像")
 col_front, col_right, col_left = st.columns(3)
 
 with col_front:
-    vid_front = st.file_uploader("1. 正面視角 (必填: 外展/穿越中線校正)", type=['mp4', 'mov', 'avi'])
+    vid_front = st.file_uploader("1. 正面視角 (外展/橫越中線檢測)", type=['mp4', 'mov', 'avi'])
 with col_right:
-    vid_right = st.file_uploader("2. 右側視角 (右手側主屈曲量測)", type=['mp4', 'mov', 'avi'])
+    vid_right = st.file_uploader("2. 右側視角 (右手側矢狀面量測)", type=['mp4', 'mov', 'avi'])
 with col_left:
-    vid_left = st.file_uploader("3. 左側視角 (左手側主屈曲量測)", type=['mp4', 'mov', 'avi'])
+    vid_left = st.file_uploader("3. 左側視角 (左手側矢狀面量測)", type=['mp4', 'mov', 'avi'])
 
-st.header("步驟二：IE 工作抽樣與人因工況設定")
+st.header("步驟二：IE 抽樣與工況參數")
 col_s1, col_s2, col_s3 = st.columns(3)
 with col_s1:
-    num_samples = st.slider("等距抽樣張數 (Work Sampling)", min_value=5, max_value=120, value=30)
+    num_samples = st.slider("等距抽樣張數 (Work Sampling)", min_value=5, max_value=120, value=20)
 with col_s2:
     combo_muscle = st.selectbox("肌肉使用分數 (Muscle Score):", ["0: 間歇動作 / 姿勢維持<1分鐘", "1: 姿勢維持>1分鐘 / 高頻率重複作業"])
 with col_s3:
@@ -299,8 +297,8 @@ if st.button("🚀 啟動 YOLOv8 多視角聯立評估", type="primary", use_con
     elif not side_video:
         st.error(f"❌ 缺少【{target_side}】的側面影像！系統需仰賴該側視角量測主要屈曲角度。")
     else:
-        with st.spinner("YOLOv8 骨架特徵提取與 RULA 多維度解算中..."):
-            model = load_yolo()
+        with st.spinner(f"正在載入 {selected_model_name} 並進行高解析特徵提取..."):
+            model = load_yolo_model(selected_model_name)
             
             t_front = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
             t_front.write(vid_front.read())
@@ -338,6 +336,7 @@ if st.button("🚀 啟動 YOLOv8 多視角聯立評估", type="primary", use_con
 
             records = []
             zip_images = []
+            display_images = []
             
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -347,11 +346,8 @@ if st.button("🚀 啟動 YOLOv8 多視角聯立評估", type="primary", use_con
                 sec, f_frame = raw_front_frames[i]
                 _, s_frame = raw_side_frames[i]
 
-                # 1. 正面判斷水平面補正
-                succ_f, front_mods, _ = analyze_front_camera_yolo(f_frame, model, target_side)
-                
-                # 2. 側面進行 2D 向量高精度量測
-                succ_s, data, side_annotated, conf = analyze_side_camera_yolo(s_frame, model, target_side, front_mods, m_val, f_val)
+                succ_f, front_mods, _ = analyze_front_camera_yolo(f_frame, model, target_side, inference_size=960)
+                succ_s, data, side_annotated, conf = analyze_side_camera_yolo(s_frame, model, target_side, front_mods, m_val, f_val, inference_size=960)
 
                 if succ_s and data is not None:
                     record = {
@@ -363,14 +359,20 @@ if st.button("🚀 啟動 YOLOv8 多視角聯立評估", type="primary", use_con
                     record.update(data)
                     records.append(record)
 
-                    # 標註結果於側視圖
-                    side_annotated = put_chinese_text(side_annotated, f"時間: {sec}s | YOLOv8 目標: {target_side}", (15, 15), (0, 255, 255), 18)
+                    side_annotated = put_chinese_text(side_annotated, f"時間: {sec}s | 模型: {selected_model_name.split('.')[0]}", (15, 15), (0, 255, 255), 18)
                     side_annotated = put_chinese_text(side_annotated, f"Grand Score: {data['最終最高分']} 分 ({data['最終 AL']})", (15, 45), (0, 0, 255) if data['最終最高分'] > 4 else (0, 255, 0), 16)
                     side_annotated = put_chinese_text(side_annotated, f"正面校正: 外展({data[f'{target_side[:2]}上臂外展補正']}) | 交叉({data[f'{target_side[:2]}橫越中線補正']})", (15, 75), (255, 150, 0), 14)
 
+                    # 轉為 RGB 供網頁前端即時預覽
+                    rgb_display = cv2.cvtColor(side_annotated, cv2.COLOR_BGR2RGB)
+                    display_images.append({
+                        "caption": f"樣本 #{i+1} ({sec} 秒) - Grand Score: {data['最終最高分']} ({data['最終 AL']})",
+                        "image": rgb_display
+                    })
+
                     is_ok, buf = cv2.imencode(".jpg", side_annotated)
                     if is_ok:
-                        zip_images.append((f"Sample_{i+1:03d}_{sec}s_YOLOv8_{target_side}.jpg", buf.tobytes()))
+                        zip_images.append((f"Sample_{i+1:03d}_{sec}s_{selected_model_name.split('.')[0]}_{target_side}.jpg", buf.tobytes()))
 
                 progress_bar.progress((i + 1) / total_samples)
                 status_text.text(f"YOLOv8 骨架運算進度: {i+1} / {total_samples} 筆完成")
@@ -384,9 +386,42 @@ if st.button("🚀 啟動 YOLOv8 多視角聯立評估", type="primary", use_con
                 for fname, fbytes in zip_images:
                     zf.writestr(f"YOLOv8標註照片庫/{fname}", fbytes)
 
-            st.success("✅ YOLOv8 多視角解算完成！請下載稽核成果包。")
+            st.success("✅ YOLOv8 姿態特徵解算完成！")
+
+            # ==================== 【網頁端即時資料呈現區】 ====================
+            if records:
+                df_result = pd.DataFrame(records)
+                
+                # 1. 摘要指標看板 (KPI Metrics)
+                st.markdown("---")
+                st.subheader("📊 人因工程危害綜合指標")
+                m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+                
+                avg_score = df_result["最終最高分"].mean()
+                max_score = df_result["最終最高分"].max()
+                high_risk_ratio = (df_result["最終最高分"] >= 5).mean() * 100
+                avg_conf = df_result["視角信賴度(%)"].mean()
+                
+                m_col1.metric("平均 RULA 分數", f"{avg_score:.2f} 分")
+                m_col2.metric("最高風險峰值", f"{max_score} 分")
+                m_col3.metric("高危害佔比 (Score ≥ 5)", f"{high_risk_ratio:.1f}%")
+                m_col4.metric("平均骨架信心度", f"{avg_conf:.1f}%")
+
+                # 2. 數據報表表格
+                st.markdown("### 📋 抽樣分析數據總表")
+                st.dataframe(df_result, use_container_width=True)
+
+                # 3. 抽樣圖片相簿預覽 (3 欄瀑布流展示)
+                st.markdown("### 🖼️ 骨架分析圖片即時預覽庫")
+                cols = st.columns(3)
+                for idx, item in enumerate(display_images):
+                    with cols[idx % 3]:
+                        st.image(item["image"], caption=item["caption"], use_container_width=True)
+
+            # 4. ZIP 封裝下載按鈕
+            st.markdown("---")
             st.download_button(
-                label=f"📦 下載 {target_side} YOLOv8 報表 (ZIP)",
+                label=f"📦 下載 {target_side} YOLOv8 完整分析報表與照片庫 (ZIP)",
                 data=zip_buffer.getvalue(),
                 file_name=f"RULA_YOLOv8_{target_side}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
                 mime="application/zip"
